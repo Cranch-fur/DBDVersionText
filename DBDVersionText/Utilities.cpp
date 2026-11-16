@@ -966,24 +966,30 @@ SDK::USplashScreen* Utilities::Game::GetSplashScreen()
 
 bool Utilities::Memory::Internal::IsValidPtr(const void* memoryPtr)
 {
-    MEMORY_BASIC_INFORMATION mbi;
-
-    if (VirtualQuery(memoryPtr, &mbi, sizeof(mbi)) != sizeof(mbi)) // Try to request (query) information about the given memory region, return False if attempt fails.
+    /*
+        VirtualQuery returns incorrect results for some memory regions
+        under Wine/Proton, so we use SEH probe-read instead.
+    */
+    if (memoryPtr == nullptr)
         return false;
 
-    if (mbi.State != MEM_COMMIT) // Memory region must be commited (actually backed by physical memory). Return False if it's not.
+    __try
+    {
+        volatile char probe = *(volatile const char*)memoryPtr;
+        (void)probe;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
         return false;
-
-    /* Strip out guard and cache flags to examine the core protection flags. */
-    DWORD protectionFlags = mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
-    if ((protectionFlags & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == false) // See if we're able to request one of the read permissions (readable or executable+read), return False if we aren't.
-        return false;
-
-    return true;
+    }
 }
 
 bool Utilities::Memory::Internal::IsValidAddress(const uintptr_t& memoryAddress)
 {
+    if (memoryAddress == 0)
+        return false;
+
     void* memoryPtr = reinterpret_cast<void*>(memoryAddress);
     return IsValidPtr(memoryPtr);
 }
