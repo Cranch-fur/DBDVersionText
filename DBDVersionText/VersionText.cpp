@@ -5,108 +5,163 @@
 
 
 
-void VersionText::SetVersionText()
+static bool IsObjectAlive(const SDK::UObject* object)
 {
-	/* Dead by Daylight 6.7.0 PTB */
-	static const size_t SCAN_POS = 0x0C1FB688;
-	static const std::vector<uintptr_t> SCAN_OFFSETS =
-	{
-			0x8,     // Offset 0
-			0x8,     // Offset 1
-			0x10,    // Offset 2
-			0x338,   // Offset 3
-			0x10,    // Offset 4
-			0x50,    // Offset 5
-			0x5D8,   // Offset 6
-			0xA0,    // Offset 7
-			0x4E0    // Offset 8
-	};
+	const uint32_t deadFlags = static_cast<uint32_t>(SDK::EObjectFlags::BeginDestroyed) | static_cast<uint32_t>(SDK::EObjectFlags::FinishDestroyed);
+	return object != nullptr && (static_cast<uint32_t>(object->Flags) & deadFlags) == 0;
+}
 
-	Utilities::Game::E_GameState gameState = Utilities::Game::GetGameState();
-	if (isVersionTextExpected && gameState == Utilities::Game::E_GameState::StartScreen)
+/* Returns the splash screen, re-using the last one found as long as it's still alive in GObjects. */
+SDK::USplashScreen* VersionText::GetCachedSplashScreen()
+{
+	if (cachedSplashScreen != nullptr && cachedSplashScreenIndex >= 0 &&
+		cachedSplashScreenIndex < SDK::UObject::GObjects->Num() &&
+		SDK::UObject::GObjects->GetByIndex(cachedSplashScreenIndex) == cachedSplashScreen &&
+		IsObjectAlive(cachedSplashScreen))
 	{
-		HMODULE hMainModule = GetModuleHandle(nullptr);
-		uintptr_t startingAddress = Utilities::Memory::Internal::AddressAddOffset(reinterpret_cast<uintptr_t>(hMainModule), SCAN_POS);
-		uintptr_t versionTextAddress = Utilities::Memory::Internal::AddressFollowPointerChain(startingAddress, SCAN_OFFSETS);
+		return cachedSplashScreen;
+	}
 
-		if (versionTextAddress)
+	cachedSplashScreen = nullptr;
+	cachedSplashScreenIndex = -1;
+
+	int32_t objectsNum = SDK::UObject::GObjects->Num();
+	for (int32_t i = 0; i < objectsNum; i++)
+	{
+		SDK::UObject* object = SDK::UObject::GObjects->GetByIndex(i);
+		if (object == nullptr || object->IsDefaultObject() || !IsObjectAlive(object))
+			continue;
+
+		if (object->IsA(SDK::USplashScreen::StaticClass()))
 		{
-			printf("[DBDVersionText] Found version text at: 0x%llX\n", (unsigned long long)versionTextAddress);
-
-			std::wstring versionText = Utilities::Memory::Internal::GetWString(versionTextAddress);
-			wprintf(L"[DBDVersionText] Current version text: %ls\n", versionText.c_str());
-
-			if (versionText.empty())
-			{
-				printf("[DBDVersionText] Version text is empty\n");
-				return;
-			}
-
-			size_t versionTextLength = versionText.length();
-			if (versionTextLength < 5)
-			{
-				printf("[DBDVersionText] Version text is too short\n");
-				return;
-			}
-
-			SDK::USplashScreen* splashScreen = Utilities::Game::GetSplashScreen();
-			if (splashScreen == nullptr)
-			{
-				printf("[DBDVersionText] Failed to locate SplashScreen\n");
-				return;
-			}
-
-			splashScreen->SetVersionText(SDK::FString(customVersionText.c_str()));
-			wprintf(L"[DBDVersionText] splashScreen->SetVersionText(%ls)\n", customVersionText.c_str());
-
-			isVersionTextExpected = false;
+			cachedSplashScreen = static_cast<SDK::USplashScreen*>(object);
+			cachedSplashScreenIndex = object->Index;
+			break;
 		}
 	}
-	else if (gameState != lastGameState && (gameState != Utilities::Game::E_GameState::StartScreen))
+
+	return cachedSplashScreen;
+}
+
+void VersionText::ResetSplashScreenState()
+{
+	hasLoggedApply = false;
+	lastApplyTick = 0;
+	cachedSplashScreen = nullptr;
+	cachedSplashScreenIndex = -1;
+}
+
+void VersionText::SetVersionText()
+{
+	Utilities::Game::E_GameState gameState = Utilities::Game::GetGameState();
+
+	if (gameState != Utilities::Game::E_GameState::StartScreen)
 	{
-		isVersionTextExpected = true;
+		if (gameState != lastGameState)
+			ResetSplashScreenState(); // next time we come back, start over.
+
+		lastGameState = gameState;
+		return;
 	}
 
 	lastGameState = gameState;
+
+	SDK::USplashScreen* splashScreen = GetCachedSplashScreen();
+	if (splashScreen == nullptr)
+		return;
+
+	ULONGLONG now = GetTickCount64();
+	if (lastApplyTick != 0 && now - lastApplyTick < REAPPLY_INTERVAL_MS)
+		return;
+	lastApplyTick = now;
+
+	splashScreen->SetVersionText(SDK::FString(customVersionText.c_str()));
+
+	if (!hasLoggedApply)
+	{
+		wprintf(L"[DBDVersionText] splashScreen->SetVersionText(%ls) [game thread]\n", customVersionText.c_str());
+		hasLoggedApply = true;
+	}
 }
 
-DWORD WINAPI VersionText::ThreadSafeWorker()
+void VersionText::SafeUpdate()
 {
-	printf("[DBDVersionText] ThreadSafeWorker() is now entering the loop\n");
-
-	while (true)
+	__try
 	{
-		EXCEPTION_POINTERS* exceptionInfo = nullptr;
+		SetVersionText();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf("[DBDVersionText] Exception inside SetVersionText(), skipping this update\n");
+		lastUpdateTick = GetTickCount64() + 3000; // back off for ~3s.
+	}
+}
 
-		__try
+
+
+
+void __fastcall VersionText::hkProcessEvent(const SDK::UObject* object, SDK::UFunction* function, void* parms)
+{
+	/* Let the game do its thing first, so we run between the game's own calls, not in the middle of one. */
+	oProcessEvent(object, function, parms);
+
+	/* Only the game thread, never re-enter (our own SDK calls go through ProcessEvent too). */
+	if (isInsideUpdate || GetCurrentThreadId() != gameThreadId)
+		return;
+
+	ULONGLONG now = GetTickCount64();
+	if (now < lastUpdateTick + 100)
+		return;
+	lastUpdateTick = now;
+
+	isInsideUpdate = true;
+	SafeUpdate();
+	isInsideUpdate = false;
+}
+
+
+
+
+/* UE runs its game thread on the process' main thread on Windows - that's the thread that was created first. */
+DWORD VersionText::FindMainThreadId()
+{
+	DWORD pid = GetCurrentProcessId();
+	DWORD bestThreadId = 0;
+	ULONGLONG bestCreationTime = ~0ull;
+
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE)
+		return 0;
+
+	THREADENTRY32 entry{};
+	entry.dwSize = sizeof(entry);
+	if (Thread32First(snapshot, &entry))
+	{
+		do
 		{
-			SetVersionText();
-			Sleep(100);
-		}
-		__except (exceptionInfo = GetExceptionInformation(), EXCEPTION_EXECUTE_HANDLER)
-		{
-			if (exceptionInfo)
+			if (entry.th32OwnerProcessID != pid)
+				continue;
+
+			HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+			if (!hThread)
+				continue;
+
+			FILETIME creation{}, exitTime{}, kernel{}, user{};
+			if (GetThreadTimes(hThread, &creation, &exitTime, &kernel, &user))
 			{
-				void* crashAddress = exceptionInfo->ExceptionRecord->ExceptionAddress;
-				DWORD exceptionCode = exceptionInfo->ExceptionRecord->ExceptionCode;
-
-				HMODULE hModule = GetModuleHandle(nullptr);
-				uintptr_t baseAddress = (uintptr_t)hModule;
-				uintptr_t relativeOffset = (uintptr_t)crashAddress - baseAddress;
-
-				printf("[DBDVersionText] FATAL ERROR / CRASH in %s\n", __FUNCSIG__);
-				printf("[DBDVersionText] Exception Code:   0x%08X\n", exceptionCode);
-				printf("[DBDVersionText] Absolute Address: 0x%llX\n", (unsigned long long)crashAddress);
-				printf("[DBDVersionText] Module Base:      0x%llX\n", (unsigned long long)baseAddress);
-				printf("[DBDVersionText] Relative Offset:  0x%llX\n", (unsigned long long)relativeOffset);
+				ULONGLONG t = (static_cast<ULONGLONG>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+				if (t != 0 && t < bestCreationTime)
+				{
+					bestCreationTime = t;
+					bestThreadId = entry.th32ThreadID;
+				}
 			}
-
-			printf("[DBDVersionText] Restarting loop in 3 seconds...\n");
-			Sleep(3000);
-		}
+			CloseHandle(hThread);
+		} while (Thread32Next(snapshot, &entry));
 	}
 
-	return 0;
+	CloseHandle(snapshot);
+	return bestThreadId;
 }
 
 
@@ -115,10 +170,10 @@ DWORD WINAPI VersionText::ThreadSafeWorker()
 void VersionText::Init()
 {
 	printf("[DBDVersionText] Starting initialization sequence...\n");
-	while (Utilities::Game::IsInitialized() == false)
-	{
-		Sleep(10);
-	}
+
+	/* Plain memory reads only - no ProcessEvent calls from this thread. */
+	while (SDK::UObject::GObjects == nullptr || SDK::UObject::GObjects->Num() == 0 || SDK::UWorld::GetWorld() == nullptr)
+		Sleep(50);
 
 	printf("[DBDVersionText] Game is initialized, looking up command line...\n");
 	std::vector<std::wstring> processArguments = Utilities::CommandLine::GetArgumentsUtf16();
@@ -145,6 +200,30 @@ void VersionText::Init()
 
 	wprintf(L"[DBDVersionText] customVersionText: \"%ls\"\n", customVersionText.c_str());
 
-	printf("[DBDVersionText] Starting ThreadSafeWorker()...\n");
-	CreateThread(0, 0, (LPTHREAD_START_ROUTINE)ThreadSafeWorker, 0, 0, 0);
+	gameThreadId = FindMainThreadId();
+	printf("[DBDVersionText] Game thread id: %lu\n", gameThreadId);
+	if (gameThreadId == 0)
+	{
+		printf("[DBDVersionText] Couldn't determine the game thread, aborting\n");
+		return;
+	}
+
+	/* customVersionText is fully set before the hook goes live, so the game thread never sees it change. */
+	void* processEventAddress = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr)) + SDK::Offsets::ProcessEvent);
+
+	MH_STATUS initStatus = MH_Initialize();
+	if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+	{
+		printf("[DBDVersionText] MH_Initialize failed\n");
+		return;
+	}
+
+	if (MH_CreateHook(processEventAddress, reinterpret_cast<void*>(&hkProcessEvent), reinterpret_cast<void**>(&oProcessEvent)) != MH_OK ||
+		MH_EnableHook(processEventAddress) != MH_OK)
+	{
+		printf("[DBDVersionText] Failed to hook ProcessEvent at 0x%p\n", processEventAddress);
+		return;
+	}
+
+	printf("[DBDVersionText] ProcessEvent hooked, version text will be applied on the game thread\n");
 }
